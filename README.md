@@ -15,3 +15,9 @@ Domain clipping and sampling are fully vectorized on GPU memory.
 The output is merged and equalized to a uniform total number of points.
 
 This script supports both single-timestep and multi-timestep processing, automatically switching modes based on user input. It is optimized for modern multi-GPU nodes (such as NVIDIA H100/H200 systems) and can process tens of millions of points per timestep with full reproducibility and minimal CPU overhead
+
+
+module purge
+module load CUDA/12.1.1
+module load OpenSSL/1.1
+module load Python/3.11.3-GCCcore-12.3.0
