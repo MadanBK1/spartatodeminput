@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""
+SPARTA Axisymmetric DSMC → 3D Point Cloud Converter
+Ultra-vectorized multi-GPU version (per-timestep multi-GPU)
+
+- Uses all GPUs for a single grid file by splitting cells across devices.
+- Preserves original transformation:
+  * cell-anchored (x, r)
+  * random θ for (y, z) and radial velocity components
+  * volume-weighted sampling per cell (multinomial)
+  * global equalization to num_total_points
+
+Author: Madan B. K. (WMU CFDLAB)
+"""
+
+import os, glob, math, numpy as np, multiprocessing
+from multiprocessing import get_context
+
+# ---------------- CONFIG ----------------
+input_dir  = "/mnt/scratch/k0006390/Impingement30m/grid"
+output_dir = "/mnt/research/WMUCFDLAB/2Daxisto3D/30m"
+os.makedirs(output_dir, exist_ok=True)
+
+start_step = 0
+end_step   = 320000
+step_size  = 20000
+
+num_total_points    = 20_000_000
+min_points_per_cell = 1
+rng_seed_base       = 20251104
+
+GAMMA, R_SPEC = 1.4, 287.0
+H2O_MU_REF, H2O_T_REF, H2O_OMEGA = 9.0e-6, 300.0, 0.75
+
+x_range   = (-30.0, 30.0)
+y_range   = (-50.0, 50.0)
+z_range   = (-50.0, 50.0)
+max_radius = 50.0
+
+# ---------------- TRY CUPY ----------------
+try:
+    import cupy as cp
+    cupy_available = True
+    print("🟢 CuPy imported.")
+except Exception as e:
+    cp = None
+    cupy_available = False
+    print(f"⚠️ CuPy not available, CPU only. Reason: {e}")
+
+# ==================================================
+def mu_h2o_vhs(TK):
+    TKc = np.maximum(np.asarray(TK, float), 1e-6)
+    return H2O_MU_REF * (TKc / H2O_T_REF) ** H2O_OMEGA
+
+
+def load_sparta_velocity(file_path):
+    """Load x, r, velocities, rho, Mach (computed), T, Kn from SPARTA grid."""
+    x_vals, r_vals, vx_vals, vr_vals = [], [], [], []
+    rho_vals, mach_vals, T_vals, Kn_vals = [], [], [], []
+    reading = False
+    with open(file_path, "r", errors="ignore") as f:
+        for line in f:
+            if line.startswith("ITEM: CELLS"):
+                reading = True
+                continue
+            if not reading or line.startswith("ITEM"):
+                continue
+            t = line.strip().split()
+            if len(t) < 13:
+                continue
+            try:
+                x, r = float(t[1]), float(t[2])
+                vx, vr = float(t[5]), float(t[6])
+                T, rho, Kn = float(t[8]), float(t[9]), float(t[12])
+                vel_mag = math.sqrt(vx * vx + vr * vr)
+                a = math.sqrt(GAMMA * R_SPEC * max(T, 1e-12))
+                M = vel_mag / a
+                x_vals.append(x); r_vals.append(r)
+                vx_vals.append(vx); vr_vals.append(vr)
+                rho_vals.append(rho); mach_vals.append(M)
+                T_vals.append(T); Kn_vals.append(Kn)
+            except:
+                continue
+    return (
+        np.array(x_vals),
+        np.array(r_vals),
+        np.array(vx_vals),
+        np.array(vr_vals),
+        np.array(rho_vals),
+        np.array(mach_vals),
+        np.array(T_vals),
+        np.array(Kn_vals),
+    )
+
+def compute_dx_dr_simple(x, r):
+    """Simple dx, dr estimate (volume weighting) using median grid spacing."""
+    if x.size < 2:
+        return np.full_like(x, 1e-6), np.full_like(r, 1e-6)
+    unique_x = np.unique(x)
+    unique_r = np.unique(r)
+    dx_med = np.median(np.diff(unique_x)) if unique_x.size > 1 else 1e-6
+    dr_med = np.median(np.diff(unique_r)) if unique_r.size > 1 else 1e-6
+    dx = np.full_like(x, dx_med)
+    dr = np.full_like(r, dr_med)
+    return dx, dr
+
+# ==================================================
+def gpu_chunk_worker_vectorized(args):
+    """
+    Fully vectorized GPU worker for one chunk of cells.
+
+    args = (
+        device_id, chunk_id, step,
+        x_chunk, r_chunk, vx_chunk, vr_chunk,
+        rho_chunk, mach_chunk, mu_chunk, Kn_chunk,
+        n_per_cell_chunk
+    )
+    """
+    (device_id, chunk_id, step,
+     x, r, vx, vr, rho, mach, mu_cell, Kn,
+     n_per_cell) = args
+
+    # isolate to one GPU
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
+    import cupy as cp
+    cp.cuda.Device(0).use()
+
+    n_cells = x.size
+    total_points = int(n_per_cell.sum())
+    print(f"🟩 GPU-{device_id}: chunk {chunk_id}, {n_cells} cells, {total_points} pts (pre-clip)")
+
+    if total_points <= 0:
+        return np.empty((0, 10), np.float32)
+
+    # move per-cell data to GPU
+    xg   = cp.asarray(x,   dtype=cp.float32)
+    rg   = cp.asarray(r,   dtype=cp.float32)
+    vxg  = cp.asarray(vx,  dtype=cp.float32)
+    vrg  = cp.asarray(vr,  dtype=cp.float32)
+    rhog = cp.asarray(rho, dtype=cp.float32)
+    Mg   = cp.asarray(mach, dtype=cp.float32)
+    mug  = cp.asarray(mu_cell, dtype=cp.float32)
+    Kng  = cp.asarray(Kn, dtype=cp.float32)
+    npc  = cp.asarray(n_per_cell, dtype=cp.int64)
+
+    # build an array of cell indices for each point: length = total_points
+    # example: npc = [2,3] -> idx = [0,0,1,1,1]
+    npc_host = np.asarray(n_per_cell, dtype=np.int64)
+    cell_ids = np.repeat(np.arange(n_cells, dtype=np.int64), npc_host)
+    cell_ids = cp.asarray(cell_ids)  # move to GPU after repeat
+
+    assert cell_ids.size == total_points
+
+    # map per-point fields by indexing
+    x_pts   = xg[cell_ids]
+    r_pts   = rg[cell_ids]
+    vx_pts  = vxg[cell_ids]
+    vr_pts  = vrg[cell_ids]
+    rho_pts = rhog[cell_ids]
+    M_pts   = Mg[cell_ids]
+    mu_pts  = mug[cell_ids]
+    Kn_pts  = Kng[cell_ids]
+
+    # random θ per point
+    rng = cp.random.default_rng(rng_seed_base + step*100 + chunk_id)
+    theta = rng.uniform(-cp.pi, cp.pi, total_points)
+
+    # position + velocity in 3D
+    y_pts = r_pts * cp.cos(theta)
+    z_pts = r_pts * cp.sin(theta)
+    x_pts = x_pts  # just rename for clarity
+
+    vy_pts = vr_pts * cp.cos(theta)
+    vz_pts = vr_pts * cp.sin(theta)
+    vx_pts = vx_pts
+
+    # domain clipping
+    mask = (
+        (x_pts >= x_range[0]) & (x_pts <= x_range[1]) &
+        (y_pts >= y_range[0]) & (y_pts <= y_range[1]) &
+        (z_pts >= z_range[0]) & (z_pts <= z_range[1]) &
+        (cp.sqrt(y_pts**2 + z_pts**2) <= max_radius)
+    )
+
+    if not cp.any(mask):
+        print(f"⚠️ GPU-{device_id}, chunk {chunk_id}: all points clipped.")
+        return np.empty((0, 10), np.float32)
+
+    x_sel   = x_pts[mask]
+    y_sel   = y_pts[mask]
+    z_sel   = z_pts[mask]
+    vx_sel  = vx_pts[mask]
+    vy_sel  = vy_pts[mask]
+    vz_sel  = vz_pts[mask]
+    rho_sel = rho_pts[mask]
+    M_sel   = M_pts[mask]
+    mu_sel  = mu_pts[mask]
+    Kn_sel  = Kn_pts[mask]
+
+    data = cp.column_stack(
+        (x_sel, y_sel, z_sel,
+         vx_sel, vy_sel, vz_sel,
+         rho_sel, M_sel, mu_sel, Kn_sel)
+    )
+
+    cpu_data = cp.asnumpy(data)
+    print(f"✅ GPU-{device_id}: chunk {chunk_id} done → {cpu_data.shape[0]} pts after clip")
+    return cpu_data
+
+# ==================================================
+def process_one_step_multi_gpu(file_path, step_index):
+    """Process one velocity.*.grid file using all available GPUs (vectorized)."""
+    step = int(os.path.basename(file_path).split(".")[1])
+    out_path = os.path.join(output_dir, f"30m{step_index}.txt")
+    print(f"\n📂 Processing {file_path} (step {step}) → {os.path.basename(out_path)}")
+
+    x, r, vx, vr, rho, mach, T, Kn = load_sparta_velocity(file_path)
+    n_cells = x.size
+    if n_cells == 0:
+        print("⚠️ No cells found; writing header only.")
+        with open(out_path, "w") as fout:
+            fout.write("x\ty\tz\tx-velocity\ty-velocity\tz-velocity\tdensity\tMach\tviscosity\tKn\n")
+        return step, out_path, 0
+
+    mu_cell = mu_h2o_vhs(T)
+    dx, dr = compute_dx_dr_simple(x, r)
+    weights = dx * dr * 2.0 * math.pi * np.maximum(r, 0.0)
+
+    # ---- point allocation (NumPy) ----
+    rng_cpu = np.random.default_rng(rng_seed_base + step)
+    probs = weights / weights.sum() if weights.sum() > 0 else np.full(n_cells, 1.0/n_cells)
+
+    base = np.full(n_cells, min_points_per_cell, int)
+    remaining = int(num_total_points - base.sum())
+    if remaining < 0:
+        effective_min = max(num_total_points // n_cells, 0)
+        print(f"⚠️ step={step}: cannot give {min_points_per_cell} per cell, using {effective_min}.")
+        base = np.full(n_cells, effective_min, int)
+        remaining = int(num_total_points - base.sum())
+
+    if remaining > 0:
+        add = rng_cpu.multinomial(remaining, probs)
+    else:
+        add = np.zeros(n_cells, int)
+    n_per_cell = base + add   # sum should be ~= num_total_points
+
+    total_expected_points = int(n_per_cell.sum())
+    print(f"🧮 step={step}: total expected points before domain clip = {total_expected_points}")
+
+    # ---- GPU availability ----
+    if not cupy_available:
+        print("⚠️ CuPy not available; falling back to CPU.")
+        return _process_one_step_cpu_fallback(file_path, step_index)
+
+    try:
+        num_gpus = cp.cuda.runtime.getDeviceCount()
+    except Exception as e:
+        print(f"⚠️ Cannot query GPUs, reason: {e}. Falling back to CPU.")
+        return _process_one_step_cpu_fallback(file_path, step_index)
+
+    if num_gpus < 1:
+        print("⚠️ No GPUs detected; falling back to CPU.")
+        return _process_one_step_cpu_fallback(file_path, step_index)
+
+    print(f"🟢 Using {num_gpus} GPU(s) for this timestep.")
+
+    # ---- split cells across GPUs by expected points (balanced) ----
+    target = total_expected_points / num_gpus
+    chunks = []
+    start = 0
+    acc = 0.0
+    current_gpu = 0
+    for i in range(n_cells):
+        acc += n_per_cell[i]
+        if acc >= target and current_gpu < num_gpus - 1:
+            end = i + 1
+            chunks.append((start, end))
+            start = end
+            acc = 0.0
+            current_gpu += 1
+    chunks.append((start, n_cells))
+
+    # adjust chunk count to exactly num_gpus
+    while len(chunks) > num_gpus:
+        a = chunks.pop()
+        b = chunks.pop()
+        chunks.append((b[0], a[1]))
+    while len(chunks) < num_gpus:
+        s, e = chunks.pop()
+        mid = s + (e - s)//2
+        chunks.append((s, mid))
+        chunks.append((mid, e))
+
+    for gid, (s, e) in enumerate(chunks):
+        pts = int(n_per_cell[s:e].sum())
+        print(f"  GPU-{gid}: cells[{s}:{e}] → {pts} expected points")
+
+    # ---- launch GPU workers ----
+    args_list = []
+    for dev_id, (s, e) in enumerate(chunks):
+        args_list.append((
+            dev_id,         # device_id
+            dev_id,         # chunk_id
+            step,
+            x[s:e], r[s:e], vx[s:e], vr[s:e],
+            rho[s:e], mach[s:e], mu_cell[s:e], Kn[s:e],
+            n_per_cell[s:e]
+        ))
+
+    ctx = get_context("spawn")
+    with ctx.Pool(processes=num_gpus) as pool:
+        gpu_results = pool.map(gpu_chunk_worker_vectorized, args_list)
+
+    # ---- merge GPU results ----
+    if gpu_results:
+        all_data = np.vstack(gpu_results)
+    else:
+        all_data = np.empty((0,10), np.float32)
+
+    n_final = all_data.shape[0]
+    print(f"📊 After domain clipping, total points from GPUs = {n_final}")
+
+    # ---- global equalization ----
+    rng_eq = np.random.default_rng(rng_seed_base + step + 9999)
+    if n_final > num_total_points:
+        idx = rng_eq.choice(n_final, num_total_points, replace=False)
+        all_data = all_data[idx]
+    elif 0 < n_final < num_total_points:
+        idx = rng_eq.choice(n_final, num_total_points - n_final, replace=True)
+        all_data = np.vstack([all_data, all_data[idx]])
+
+    # ---- write final output ----
+    with open(out_path, "w") as fout:
+        fout.write(f"# Domain bounds: x={x_range}, y={y_range}, z={z_range}, Rmax={max_radius}\n")
+        fout.write("x\ty\tz\tx-velocity\ty-velocity\tz-velocity\tdensity\tMach\tviscosity\tKn\n")
+        np.savetxt(fout, all_data, fmt="%.6g", delimiter="\t")
+
+    print(f"✅ Done (multi-GPU, vectorized): {os.path.basename(out_path)} ({all_data.shape[0]} points)")
+    return step, out_path, all_data.shape[0]
+
+# ==================================================
+def _process_one_step_cpu_fallback(file_path, step_index):
+    """
+    CPU fallback using same sampling logic (slower, but same physics).
+    """
+    step = int(os.path.basename(file_path).split(".")[1])
+    out_path = os.path.join(output_dir, f"30m{step_index}.txt")
+    print(f"\n⚙️ CPU fallback: Processing {file_path} (step {step}) → {os.path.basename(out_path)}")
+
+    x, r, vx, vr, rho, mach, T, Kn = load_sparta_velocity(file_path)
+    n_cells = x.size
+    if n_cells == 0:
+        print("⚠️ No cells found; writing header only.")
+        with open(out_path, "w") as fout:
+            fout.write("x\ty\tz\tx-velocity\ty-velocity\tz-velocity\tdensity\tMach\tviscosity\tKn\n")
+        return step, out_path, 0
+
+    mu_cell = mu_h2o_vhs(T)
+    dx, dr = compute_dx_dr_simple(x, r)
+    weights = dx * dr * 2.0 * math.pi * np.maximum(r, 0.0)
+
+    rng_cpu = np.random.default_rng(rng_seed_base + step)
+    probs = weights / weights.sum() if weights.sum() > 0 else np.full(n_cells, 1.0/n_cells)
+
+    base = np.full(n_cells, min_points_per_cell, int)
+    remaining = int(num_total_points - base.sum())
+    if remaining < 0:
+        effective_min = max(num_total_points // n_cells, 0)
+        print(f"⚠️ step={step}: cannot give {min_points_per_cell} per cell, using {effective_min}.")
+        base = np.full(n_cells, effective_min, int)
+        remaining = int(num_total_points - base.sum())
+
+    if remaining > 0:
+        add = rng_cpu.multinomial(remaining, probs)
+    else:
+        add = np.zeros(n_cells, int)
+    n_per_cell = base + add
+
+    rows = []
+    for i in range(n_cells):
+        cnt = int(n_per_cell[i])
+        if cnt <= 0:
+            continue
+        theta = rng_cpu.uniform(-math.pi, math.pi, cnt)
+
+        xi = np.full(cnt, x[i], np.float32)
+        yi = r[i] * np.cos(theta)
+        zi = r[i] * np.sin(theta)
+
+        vxi = np.full(cnt, vx[i], np.float32)
+        vyi = vr[i] * np.cos(theta)
+        vzi = vr[i] * np.sin(theta)
+
+        rhoi  = np.full(cnt, rho[i],  np.float32)
+        Mi    = np.full(cnt, mach[i], np.float32)
+        mui   = np.full(cnt, mu_cell[i], np.float32)
+        Kni   = np.full(cnt, Kn[i],    np.float32)
+
+        mask = (
+            (xi >= x_range[0]) & (xi <= x_range[1]) &
+            (yi >= y_range[0]) & (yi <= y_range[1]) &
+            (zi >= z_range[0]) & (zi <= z_range[1]) &
+            (np.sqrt(yi**2 + zi**2) <= max_radius)
+        )
+        if not np.any(mask):
+            continue
+        data = np.column_stack(
+            (xi[mask], yi[mask], zi[mask],
+             vxi[mask], vyi[mask], vzi[mask],
+             rhoi[mask], Mi[mask], mui[mask], Kni[mask])
+        )
+        rows.append(data)
+
+    if rows:
+        all_data = np.vstack(rows)
+    else:
+        all_data = np.empty((0,10), np.float32)
+
+    n_final = all_data.shape[0]
+    rng_eq = np.random.default_rng(rng_seed_base + step + 9999)
+    if n_final > num_total_points:
+        idx = rng_eq.choice(n_final, num_total_points, replace=False)
+        all_data = all_data[idx]
+    elif 0 < n_final < num_total_points:
+        idx = rng_eq.choice(n_final, num_total_points - n_final, replace=True)
+        all_data = np.vstack([all_data, all_data[idx]])
+
+    with open(out_path, "w") as fout:
+        fout.write(f"# Domain bounds: x={x_range}, y={y_range}, z={z_range}, Rmax={max_radius}\n")
+        fout.write("x\ty\tz\tx-velocity\ty-velocity\tz-velocity\tdensity\tMach\tviscosity\tKn\n")
+        np.savetxt(fout, all_data, fmt="%.6g", delimiter="\t")
+
+    print(f"✅ CPU fallback done: {os.path.basename(out_path)} ({all_data.shape[0]} points)")
+    return step, out_path, all_data.shape[0]
+
+# ==================================================
+def main():
+    def timestep_from_filename(fp):
+        try:
+            return int(os.path.basename(fp).split(".")[1])
+        except:
+            return -1
+
+    files = sorted(
+        glob.glob(os.path.join(input_dir, "velocity.*.grid")),
+        key=timestep_from_filename,
+    )
+
+    selected = []
+    for fp in files:
+        s = timestep_from_filename(fp)
+        if start_step <= s <= end_step and (s - start_step) % step_size == 0:
+            selected.append((fp, len(selected)))
+
+    if not selected:
+        print("❌ No files found in given step range.")
+        return
+
+    print("📌 Selected files:")
+    for fp, idx in selected:
+        print(f"    {fp} → 30m{idx}.txt")
+
+    results = []
+    for fp, idx in selected:
+        res = process_one_step_multi_gpu(fp, idx)
+        results.append(res)
+
+    print("\n📖 Summary mapping:")
+    for step, out, count in results:
+        print(f" Step {step} → {os.path.basename(out)} ({count} points)")
+
+if __name__ == "__main__":
+    main()
