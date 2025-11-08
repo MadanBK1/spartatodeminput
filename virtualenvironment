@@ -1,0 +1,103 @@
+#######################################################################
+# CuPy + CUDA 12.1.1 Virtual Environment (WMU CFDLAB)
+# ---------------------------------------------------
+# Location:
+#   /mnt/ufs18/nodr/research/WMUCFDLAB/python/cupy_env
+#
+# Usage:
+#   source /mnt/ufs18/nodr/research/WMUCFDLAB/python/cupy_env/bin/activate
+#   deactivate
+#
+# To verify CUDA linkage:
+#   python -m cupy.show_config
+#
+# To edit or update environment in future:
+#   1. Open this file with: nano bin/activate
+#   2. Scroll to the bottom where CUDA variables are set.
+#   3. Update CUDA version or environment variables if needed.
+#   4. Save and exit.
+#
+# To add Python packages:
+#   source bin/activate
+#   pip install <package_name>
+#
+# This environment automatically loads CUDA/12.1.1 each time.
+#######################################################################
+
+# This file must be used with "source bin/activate" *from bash*
+# you cannot run it directly
+
+deactivate () {
+    # reset old environment variables
+    if [ -n "${_OLD_VIRTUAL_PATH:-}" ] ; then
+        PATH="${_OLD_VIRTUAL_PATH:-}"
+        export PATH
+        unset _OLD_VIRTUAL_PATH
+    fi
+    if [ -n "${_OLD_VIRTUAL_PYTHONHOME:-}" ] ; then
+        PYTHONHOME="${_OLD_VIRTUAL_PYTHONHOME:-}"
+        export PYTHONHOME
+        unset _OLD_VIRTUAL_PYTHONHOME
+    fi
+
+    # This should detect bash and zsh, which have a hash command that must
+    # be called to get it to forget past commands.  Without forgetting
+    # past commands the $PATH changes we made may not be respected
+    if [ -n "${BASH:-}" -o -n "${ZSH_VERSION:-}" ] ; then
+        hash -r 2> /dev/null
+    fi
+
+    if [ -n "${_OLD_VIRTUAL_PS1:-}" ] ; then
+        PS1="${_OLD_VIRTUAL_PS1:-}"
+        export PS1
+        unset _OLD_VIRTUAL_PS1
+    fi
+
+    unset VIRTUAL_ENV
+    unset VIRTUAL_ENV_PROMPT
+    if [ ! "${1:-}" = "nondestructive" ] ; then
+        # Self destruct!
+        unset -f deactivate
+    fi
+}
+
+# unset irrelevant variables
+deactivate nondestructive
+
+VIRTUAL_ENV="/mnt/ufs18/nodr/research/WMUCFDLAB/python/cupy_env"
+export VIRTUAL_ENV
+
+_OLD_VIRTUAL_PATH="$PATH"
+PATH="$VIRTUAL_ENV/bin:$PATH"
+export PATH
+
+# unset PYTHONHOME if set
+# this will fail if PYTHONHOME is set to the empty string (which is bad anyway)
+# could use `if (set -u; : $PYTHONHOME) ;` in bash
+if [ -n "${PYTHONHOME:-}" ] ; then
+    _OLD_VIRTUAL_PYTHONHOME="${PYTHONHOME:-}"
+    unset PYTHONHOME
+fi
+
+if [ -z "${VIRTUAL_ENV_DISABLE_PROMPT:-}" ] ; then
+    _OLD_VIRTUAL_PS1="${PS1:-}"
+    PS1="(cupy_env) ${PS1:-}"
+    export PS1
+    VIRTUAL_ENV_PROMPT="(cupy_env) "
+    export VIRTUAL_ENV_PROMPT
+fi
+
+# This should detect bash and zsh, which have a hash command that must
+# be called to get it to forget past commands.  Without forgetting
+# past commands the $PATH changes we made may not be respected
+if [ -n "${BASH:-}" -o -n "${ZSH_VERSION:-}" ] ; then
+    hash -r 2> /dev/null
+fi
+
+# --- CuPy + CUDA 12.1.1 persistent environment ---
+module load CUDA/12.1.1
+export CUDA_HOME=$EBROOTCUDA
+export LD_LIBRARY_PATH=$EBROOTCUDA/lib64:$LD_LIBRARY_PATH
+export PATH=$EBROOTCUDA/bin:$PATH
+export CUPY_CUDA_PATH=$EBROOTCUDA
+export CUPY_NVRTC_PATH=$EBROOTCUDA/lib64/libnvrtc.so.12
